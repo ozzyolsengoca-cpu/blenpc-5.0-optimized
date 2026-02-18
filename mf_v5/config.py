@@ -1,5 +1,9 @@
-"""Centralized configuration for MF v5.1 generation pipeline."""
+"""Centralized configuration and logging for MF v5.1 generation pipeline."""
 
+import logging
+import os
+
+# --- Generation Constants ---
 GRID = 0.25
 EPSILON = 1e-4
 
@@ -23,6 +27,24 @@ ROOF_HEIGHT = 1.2
 MERGE_DISTANCE = 5e-4
 DISSOLVE_ANGLE = 0.01
 
+# --- Logging Configuration ---
+# Set MF_DEBUG=1 to enable debug logging
+DEBUG_MODE = os.environ.get("MF_DEBUG", "0") == "1"
+
+def setup_logger(name: str = "MFv5"):
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)s | %(name)s: %(message)s',
+            datefmt='%H:%M:%S'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
+    return logger
+
+logger = setup_logger()
 
 def snap(value: float) -> float:
     """Snap a value to the global grid."""

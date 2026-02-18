@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
+import time
 
 try:
     import bpy
@@ -15,7 +16,7 @@ except ImportError:
 
 from .adjacency import build_adjacency, corridor_facing_walls
 from .cleanup import dedupe_segments, remove_zero_length_segments
-from .config import STORY_HEIGHT
+from .config import STORY_HEIGHT, logger
 from .datamodel import BuildingSpec, RoofType, Rect
 from .doors import carve_doors, corridor_door_openings
 from .export import ExportSettings, export_manifest
@@ -24,6 +25,7 @@ from .merge import default_merge_plan, summarize_cleanup
 from .roof import build_roof
 from .slabs import build_floor_ceiling_slabs, build_navmesh_slabs
 from .walls import build_room_wall_segments
+from .exceptions import GenerationError, ExportError, ConfigurationError
 
 
 @dataclass
@@ -45,6 +47,13 @@ class GenerationOutput:
 
 
 def generate(spec: BuildingSpec, output_dir: Path) -> GenerationOutput:
+    """Procedurally generate a building based on spec."""
+    start_time = time.time()
+    logger.info(f"Starting generation: {spec.width}x{spec.depth}, {spec.floors} floors (Seed: {spec.seed})")
+    
+    if spec.width < 5 or spec.depth < 5:
+        raise ConfigurationError(f"Building dimensions too small: {spec.width}x{spec.depth}")
+
     floor_outputs: List[FloorOutput] = []
     top_footprint = None
     top_z = 0.0
@@ -52,75 +61,86 @@ def generate(spec: BuildingSpec, output_dir: Path) -> GenerationOutput:
     # For Blender rendering
     blender_objects = []
 
-    for floor_idx in range(spec.floors):
-        rooms, corridor = generate_floorplan(spec.width, spec.depth, spec.seed, floor_idx)
-        adjacency = build_adjacency(rooms)
-        wall_segments_by_room = build_room_wall_segments(rooms)
-        corridor_faces = corridor_facing_walls(rooms, corridor)
-        room_rect_lookup = {
-            r.id: (r.rect.min_x, r.rect.min_y, r.rect.max_x, r.rect.max_y) for r in rooms
-        }
-        openings = corridor_door_openings(corridor_faces, room_rect_lookup)
-        carved = carve_doors(wall_segments_by_room, openings)
+    try:
+        for floor_idx in range(spec.floors):
+            logger.debug(f"Processing Floor {floor_idx}...")
+            rooms, corridor = generate_floorplan(spec.width, spec.depth, spec.seed, floor_idx)
+            adjacency = build_adjacency(rooms)
+            wall_segments_by_room = build_room_wall_segments(rooms)
+            corridor_faces = corridor_facing_walls(rooms, corridor)
+            room_rect_lookup = {
+                r.id: (r.rect.min_x, r.rect.min_y, r.rect.max_x, r.rect.max_y) for r in rooms
+            }
+            openings = corridor_door_openings(corridor_faces, room_rect_lookup)
+            carved = carve_doors(wall_segments_by_room, openings)
 
-        merged_walls = [seg for segs in carved.values() for seg in segs]
-        merged_walls = dedupe_segments(remove_zero_length_segments(merged_walls))
-        
-        floor_z_offset = floor_idx * STORY_HEIGHT
-        
-        slabs = build_floor_ceiling_slabs(rooms, floor_idx)
-        
-        if bpy:
-            # Create meshes in Blender
-            wall_obj = create_wall_mesh(merged_walls, f"Walls_F{floor_idx}")
-            wall_obj.location.z = floor_z_offset
-            blender_objects.append(wall_obj)
+            merged_walls = [seg for segs in carved.values() for seg in segs]
+            merged_walls = dedupe_segments(remove_zero_length_segments(merged_walls))
             
-            slab_obj = create_slab_mesh(slabs, f"Slabs_F{floor_idx}")
-            # Slab Z is already absolute in slabs.py, so we don't set location.z here
-            blender_objects.append(slab_obj)
+            floor_z_offset = floor_idx * STORY_HEIGHT
+            
+            slabs = build_floor_ceiling_slabs(rooms, floor_idx)
+            
+            if bpy:
+                # Create meshes in Blender
+                wall_obj = create_wall_mesh(merged_walls, f"Walls_F{floor_idx}")
+                wall_obj.location.z = floor_z_offset
+                blender_objects.append(wall_obj)
+                
+                slab_obj = create_slab_mesh(slabs, f"Slabs_F{floor_idx}")
+                blender_objects.append(slab_obj)
 
-        if rooms:
-            min_x = min(r.rect.min_x for r in rooms)
-            min_y = min(r.rect.min_y for r in rooms)
-            max_x = max(r.rect.max_x for r in rooms)
-            max_y = max(r.rect.max_y for r in rooms)
-            top_footprint = (min_x, min_y, max_x, max_y)
-            top_z = (floor_idx + 1) * STORY_HEIGHT
+            if rooms:
+                min_x = min(r.rect.min_x for r in rooms)
+                min_y = min(r.rect.min_y for r in rooms)
+                max_x = max(r.rect.max_x for r in rooms)
+                max_y = max(r.rect.max_y for r in rooms)
+                top_footprint = (min_x, min_y, max_x, max_y)
+                top_z = (floor_idx + 1) * STORY_HEIGHT
 
-        floor_outputs.append(
-            FloorOutput(
-                floor_index=floor_idx,
-                room_count=len(rooms),
-                adjacency=adjacency,
-                wall_segment_count=len(merged_walls),
-                door_count=len(openings),
+            floor_outputs.append(
+                FloorOutput(
+                    floor_index=floor_idx,
+                    room_count=len(rooms),
+                    adjacency=adjacency,
+                    wall_segment_count=len(merged_walls),
+                    door_count=len(openings),
+                )
             )
+
+        if top_footprint:
+            roof_rect = Rect(*top_footprint)
+            roof_geo = build_roof(roof_rect, top_z, spec.roof_type)
+            if bpy and roof_geo:
+                roof_obj = create_roof_mesh(roof_geo, "Roof")
+                blender_objects.append(roof_obj)
+
+        glb_path = None
+        if bpy and blender_objects:
+            logger.info(f"Merging {len(blender_objects)} objects and cleaning up...")
+            final_obj = final_merge_and_cleanup(blender_objects)
+            if final_obj:
+                settings = ExportSettings()
+                logger.info(f"Exporting to GLB in {output_dir}...")
+                paths = export_to_glb(output_dir, "Building", settings)
+                if paths:
+                    glb_path = str(paths[0])
+            else:
+                raise ExportError("Failed to create merged building object.")
+
+        settings = ExportSettings()
+        manifest_path = export_manifest(output_dir / "export_manifest.json", "Building", settings)
+        
+        duration = time.time() - start_time
+        logger.info(f"Generation completed successfully in {duration:.3f}s")
+
+        return GenerationOutput(
+            floors=floor_outputs,
+            roof_type=spec.roof_type.value,
+            cleanup=summarize_cleanup(default_merge_plan()),
+            export_manifest=str(manifest_path),
+            glb_path=glb_path
         )
-
-    if top_footprint:
-        roof_rect = Rect(*top_footprint)
-        roof_geo = build_roof(roof_rect, top_z, spec.roof_type)
-        if bpy and roof_geo:
-            roof_obj = create_roof_mesh(roof_geo, "Roof")
-            blender_objects.append(roof_obj)
-
-    glb_path = None
-    if bpy and blender_objects:
-        final_obj = final_merge_and_cleanup(blender_objects)
-        if final_obj:
-            settings = ExportSettings()
-            paths = export_to_glb(output_dir, "Building", settings)
-            if paths:
-                glb_path = str(paths[0])
-
-    settings = ExportSettings()
-    manifest_path = export_manifest(output_dir / "export_manifest.json", "Building", settings)
-
-    return GenerationOutput(
-        floors=floor_outputs,
-        roof_type=spec.roof_type.value,
-        cleanup=summarize_cleanup(default_merge_plan()),
-        export_manifest=str(manifest_path),
-        glb_path=glb_path
-    )
+    except Exception as e:
+        logger.error(f"Generation failed: {str(e)}")
+        raise GenerationError(f"Critical error during building generation: {e}") from e
