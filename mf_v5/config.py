@@ -1,0 +1,28 @@
+"""Centralized configuration for MF v5.1 generation pipeline."""
+
+GRID = 0.25
+EPSILON = 1e-4
+
+# Dimensions (meters)
+WALL_THICKNESS = 0.20
+WALL_HEIGHT = 3.0
+FLOOR_THICKNESS = 0.20
+CEILING_THICKNESS = 0.15
+
+DOOR_WIDTH = 0.9
+DOOR_HEIGHT = 2.1
+
+CORRIDOR_WIDTH = 1.8
+MIN_ROOM_SIZE = 2.5
+
+# Roof
+ROOF_HEIGHT = 1.2
+
+# Cleanup
+MERGE_DISTANCE = 5e-4
+DISSOLVE_ANGLE = 0.01
+
+
+def snap(value: float) -> float:
+    """Snap a value to the global grid."""
+    return round(value / GRID) * GRID
